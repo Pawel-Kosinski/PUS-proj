@@ -1,0 +1,10 @@
+/*
+
+!/client/
+!/.gitignore
+
+# Artefakty kompilacji
+*.o
+*.a
+*.so
+/client/secvault
