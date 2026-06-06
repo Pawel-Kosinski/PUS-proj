@@ -1,0 +1,96 @@
+"""protocol.py - stałe protokołu SecVault (SVP v1.0).
+
+Wspólny kontrakt klient<->serwer. Wartości muszą być identyczne jak w wersji C++
+(client/src/protocol.h) i w client/PROTOCOL.md, aby zachować zgodność na poziomie bajtów.
+"""
+
+SVP_VERSION = 0x01
+SVP_PORT = 7443
+
+# Nagłówek ramki: VERSION(1) | MSG_TYPE(1) | FLAGS(1) | SEQ_ID(4) | PAYLOAD_LEN(4) = 11B
+HEADER_LEN = 11
+HMAC_LEN = 32                 # trailer HMAC-SHA256
+MAX_PAYLOAD = 1 << 20         # 1 MiB na ramkę (TS-06)
+
+# --- typy komunikatów ---
+MSG_HELLO = 0x01
+MSG_CHALLENGE = 0x02
+MSG_AUTH = 0x03
+MSG_AUTH_OK = 0x04
+MSG_AUTH_FAIL = 0x05
+MSG_REGISTER = 0x06          # rozszerzenie: rejestracja konta z CLI
+MSG_REGISTER_OK = 0x07
+MSG_VAULT_GET = 0x10
+MSG_VAULT_DATA = 0x11
+MSG_VAULT_PUT = 0x12
+MSG_VAULT_ACK = 0x13
+MSG_VAULT_SYNC = 0x14
+MSG_PING = 0x20
+MSG_PONG = 0x21
+MSG_BYE = 0x2E
+MSG_ERROR = 0x2F
+
+# --- flagi (bitfield) ---
+FLAG_NONE = 0x00
+FLAG_FRAGMENTED = 0x01
+FLAG_LAST_FRAG = 0x02
+FLAG_COMPRESSED = 0x04
+FLAG_TOTP_PRESENT = 0x08
+FLAG_TOKEN_REFRESH = 0x10
+
+# --- kody błędów ---
+ERR_AUTH_FAILED = 0x01
+ERR_RATE_LIMITED = 0x02
+ERR_CLOCK_SKEW = 0x03
+ERR_CONFLICT = 0x04
+ERR_NOT_FOUND = 0x05
+ERR_TOO_LARGE = 0x06
+ERR_SESSION_EXPIRED = 0x07
+ERR_FORBIDDEN = 0x08
+ERR_UNKNOWN_TYPE = 0x09
+ERR_BAD_HMAC = 0x0A
+ERR_INTERNAL = 0xFF
+
+# --- powody BYE ---
+BYE_NORMAL = 0x00
+BYE_TIMEOUT = 0x01
+BYE_SHUTDOWN = 0x02
+
+# --- parametry kryptografii (zgodne z planem aplikacji) ---
+PBKDF2_ITERS = 200000
+KEY_LEN = 32                 # AES-256 / HMAC-SHA256
+NONCE_LEN = 16
+CLIENT_ID_LEN = 16
+VAULT_ID_LEN = 16
+GCM_IV_LEN = 12
+GCM_TAG_LEN = 16
+
+_ERR_NAMES = {
+    ERR_AUTH_FAILED: "ERR_AUTH_FAILED",
+    ERR_RATE_LIMITED: "ERR_RATE_LIMITED",
+    ERR_CLOCK_SKEW: "ERR_CLOCK_SKEW",
+    ERR_CONFLICT: "ERR_CONFLICT",
+    ERR_NOT_FOUND: "ERR_NOT_FOUND",
+    ERR_TOO_LARGE: "ERR_TOO_LARGE",
+    ERR_SESSION_EXPIRED: "ERR_SESSION_EXPIRED",
+    ERR_FORBIDDEN: "ERR_FORBIDDEN",
+    ERR_UNKNOWN_TYPE: "ERR_UNKNOWN_TYPE",
+    ERR_BAD_HMAC: "ERR_BAD_HMAC",
+    ERR_INTERNAL: "ERR_INTERNAL",
+}
+
+_MSG_NAMES = {
+    MSG_HELLO: "HELLO", MSG_CHALLENGE: "CHALLENGE", MSG_AUTH: "AUTH",
+    MSG_AUTH_OK: "AUTH_OK", MSG_AUTH_FAIL: "AUTH_FAIL", MSG_REGISTER: "REGISTER",
+    MSG_REGISTER_OK: "REGISTER_OK", MSG_VAULT_GET: "VAULT_GET", MSG_VAULT_DATA: "VAULT_DATA",
+    MSG_VAULT_PUT: "VAULT_PUT", MSG_VAULT_ACK: "VAULT_ACK", MSG_VAULT_SYNC: "VAULT_SYNC",
+    MSG_PING: "PING", MSG_PONG: "PONG", MSG_BYE: "BYE", MSG_ERROR: "ERROR",
+}
+
+
+def err_name(code: int) -> str:
+    return _ERR_NAMES.get(code, "ERR_UNKNOWN")
+
+
+def msg_name(t: int) -> str:
+    return _MSG_NAMES.get(t, "UNKNOWN")

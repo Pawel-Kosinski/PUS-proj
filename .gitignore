@@ -2,6 +2,7 @@
 
 !/client/
 !/.gitignore
+!/client-py/
 
 # Artefakty kompilacji
 *.o
