@@ -9,7 +9,9 @@ from pathlib import Path
 import ssl
 import struct
 import time
-from typing import Callable, cast
+
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from database import DatabaseManager, init_db
 from protocol import MsgType, SVPCodec, SVPFlags, SVPFormatError, SVPFrame, SVPHmacError
@@ -25,6 +27,17 @@ DUMMY_MAC_KEY: bytes = b"\x00" * 32
 MAX_CLOCK_SKEW_MS: int = 5 * 60 * 1000
 SESSION_TTL_MS: int = 24 * 60 * 60 * 1000
 ERR_AUTH_FAILED: int = 0x06
+ERR_NOT_FOUND: int = 0x08
+ERR_CONFLICT: int = 0x0A
+FRAGMENT_TIMEOUT_SECONDS: float = 30.0
+
+HELLO_STRUCT: struct.Struct = struct.Struct("<32s16sQ")
+VAULT_GET_STRUCT: struct.Struct = struct.Struct("<16sQ")
+VAULT_PUT_HEADER_STRUCT: struct.Struct = struct.Struct("<16sQI")
+AUTH_OK_TRAILER_STRUCT: struct.Struct = struct.Struct("<QQ")
+AUTH_FAIL_STRUCT: struct.Struct = struct.Struct("<BI")
+MAX_VAULT_BLOB_BYTES: int = 50 * 1024 * 1024
+MAX_FRAGMENTED_VAULT_PUT_BYTES: int = MAX_VAULT_BLOB_BYTES + VAULT_PUT_HEADER_STRUCT.size
 
 LOGGER: logging.Logger = logging.getLogger("secvault.server")
 
@@ -61,7 +74,7 @@ def get_ssl_context(cert_path: str, key_path: str) -> ssl.SSLContext:
         )
 
     try:
-        cast(Callable[[str], None], set_ciphersuites)(TLS13_CIPHERSUITES)
+        set_ciphersuites(TLS13_CIPHERSUITES)
     except ssl.SSLError as exc:
         raise RuntimeError("Failed to configure required TLS 1.3 cipher suites.") from exc
     '''
@@ -93,11 +106,12 @@ async def _send_frame(
     payload: bytes,
     seq_id: int,
     mac_key: bytes,
+    flags: SVPFlags = SVPFlags.NONE,
 ) -> None:
     frame: SVPFrame = SVPFrame(
         version=1,
         msg_type=msg_type,
-        flags=SVPFlags.NONE,
+        flags=flags,
         seq_id=seq_id,
         payload_len=len(payload),
         payload=payload,
@@ -107,12 +121,52 @@ async def _send_frame(
     await writer.drain()
 
 
+async def _send_fragmented_payload(
+    writer: asyncio.StreamWriter,
+    msg_type: MsgType,
+    payload: bytes,
+    seq_id: int,
+    mac_key: bytes,
+) -> int:
+    if len(payload) <= SVPCodec.MAX_PAYLOAD_LEN:
+        await _send_frame(
+            writer=writer,
+            msg_type=msg_type,
+            payload=payload,
+            seq_id=seq_id,
+            mac_key=mac_key,
+            flags=SVPFlags.NONE,
+        )
+        return seq_id + 1
+
+    next_seq: int = seq_id
+    chunk_size: int = SVPCodec.MAX_PAYLOAD_LEN
+    offset: int = 0
+    while offset < len(payload):
+        chunk: bytes = payload[offset : offset + chunk_size]
+        flags: SVPFlags = SVPFlags.FRAGMENTED
+        if offset + len(chunk) >= len(payload):
+            flags |= SVPFlags.LAST_FRAG
+
+        await _send_frame(
+            writer=writer,
+            msg_type=msg_type,
+            payload=chunk,
+            seq_id=next_seq,
+            mac_key=mac_key,
+            flags=flags,
+        )
+        next_seq += 1
+        offset += len(chunk)
+
+    return next_seq
+
+
 def _parse_hello_payload(payload: bytes) -> tuple[bytes, bytes, int]:
-    expected_len: int = 32 + 16 + 8
-    if len(payload) != expected_len:
+    if len(payload) != HELLO_STRUCT.size:
         raise SVPFormatError("HELLO payload has invalid length")
 
-    nonce_c, client_id, timestamp_ms = struct.unpack("<32s16sQ", payload)
+    nonce_c, client_id, timestamp_ms = HELLO_STRUCT.unpack(payload)
     if abs(_now_ms() - int(timestamp_ms)) > MAX_CLOCK_SKEW_MS:
         raise SVPFormatError("HELLO timestamp exceeds allowed clock skew")
 
@@ -148,20 +202,63 @@ def _build_auth_ok_payload(session_token: bytes, expiry_ms: int, vault_version: 
     return (
         struct.pack("<H", len(session_token))
         + session_token
-        + struct.pack("<Q", expiry_ms)
-        + struct.pack("<Q", vault_version)
+        + AUTH_OK_TRAILER_STRUCT.pack(expiry_ms, vault_version)
     )
 
 
 def _build_auth_fail_payload() -> bytes:
-    return struct.pack("<BI", ERR_AUTH_FAILED, 0)
+    return AUTH_FAIL_STRUCT.pack(ERR_AUTH_FAILED, 0)
+
+
+def _build_error_payload(error_code: int) -> bytes:
+    return struct.pack("<B", error_code)
+
+
+def _build_vault_data_payload(vault_id: bytes, version: int, blob: bytes) -> bytes:
+    return vault_id + struct.pack("<Q", version) + blob
+
+
+def _build_vault_ack_payload(vault_id: bytes, new_version: int) -> bytes:
+    return vault_id + struct.pack("<Q", new_version)
+
+
+def _parse_vault_get_payload(payload: bytes) -> tuple[bytes, int]:
+    if len(payload) != VAULT_GET_STRUCT.size:
+        raise SVPFormatError("VAULT_GET payload has invalid length")
+    return VAULT_GET_STRUCT.unpack(payload)
+
+
+def _parse_vault_put_payload(payload: bytes) -> tuple[bytes, int, bytes]:
+    if len(payload) < VAULT_PUT_HEADER_STRUCT.size:
+        raise SVPFormatError("VAULT_PUT payload is too short")
+
+    vault_id, base_version, blob_len = VAULT_PUT_HEADER_STRUCT.unpack_from(payload, 0)
+    if blob_len > MAX_VAULT_BLOB_BYTES:
+        raise SVPFormatError("VAULT_PUT blob exceeds server size limit")
+
+    expected_len: int = VAULT_PUT_HEADER_STRUCT.size + blob_len
+    if len(payload) != expected_len:
+        raise SVPFormatError("VAULT_PUT payload length does not match blob_len")
+
+    blob: bytes = payload[VAULT_PUT_HEADER_STRUCT.size:expected_len]
+    return vault_id, base_version, blob
+
+
+def _derive_mac_key(session_token: bytes, nonce_c: bytes) -> bytes:
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=nonce_c,
+        info=b"svp-mac",
+    )
+    return hkdf.derive(session_token)
 
 
 async def handle_client(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
 ) -> None:
-    """Handle one TLS client and perform SVP greeting/authentication handshake."""
+    """Handle one TLS client and run the SVP session state machine."""
     peername = writer.get_extra_info("peername")
     client_ip: str = "unknown"
     client_port: int = 0
@@ -176,16 +273,54 @@ async def handle_client(
     nonce_c: bytes | None = None
     nonce_s: bytes | None = None
     client_id: bytes | None = None
+    authenticated_user_id: int | None = None
+    session_mac_key: bytes | None = None
+    fragmented_put_buffer: bytearray | None = None
+    fragment_started_at: float | None = None
 
     try:
         async with DatabaseManager(DB_PATH) as db:
             while True:
                 if state in {"GREETING", "AUTHENTICATING"}:
-                    mac_key: bytes = DUMMY_MAC_KEY
+                    active_mac_key: bytes = DUMMY_MAC_KEY
                 else:
-                    mac_key = DUMMY_MAC_KEY
+                    if session_mac_key is None:
+                        raise SVPFormatError("missing session MAC key in ESTABLISHED state")
+                    active_mac_key = session_mac_key
 
-                frame: SVPFrame = await _read_frame(reader, mac_key)
+                if state == "ESTABLISHED" and fragmented_put_buffer is not None:
+                    if fragment_started_at is None:
+                        fragmented_put_buffer = None
+                    else:
+                        remaining: float = FRAGMENT_TIMEOUT_SECONDS - (
+                            time.monotonic() - fragment_started_at
+                        )
+                        if remaining <= 0:
+                            LOGGER.warning(
+                                "Dropping incomplete fragmented VAULT_PUT from %s:%d (timeout)",
+                                client_ip,
+                                client_port,
+                            )
+                            fragmented_put_buffer = None
+                            fragment_started_at = None
+                            continue
+
+                        try:
+                            frame = await asyncio.wait_for(
+                                _read_frame(reader, active_mac_key),
+                                timeout=remaining,
+                            )
+                        except asyncio.TimeoutError:
+                            LOGGER.warning(
+                                "Dropping incomplete fragmented VAULT_PUT from %s:%d (timeout)",
+                                client_ip,
+                                client_port,
+                            )
+                            fragmented_put_buffer = None
+                            fragment_started_at = None
+                            continue
+                else:
+                    frame = await _read_frame(reader, active_mac_key)
 
                 if state == "GREETING":
                     if frame.msg_type != MsgType.HELLO:
@@ -240,9 +375,10 @@ async def handle_client(
 
                     session_token: bytes = os.urandom(32)
                     expiry: int = _now_ms() + SESSION_TTL_MS
+                    authenticated_user_id = int(user["id"])
                     await db.create_session(
                         token=session_token,
-                        user_id=int(user["id"]),
+                        user_id=authenticated_user_id,
                         expiry=expiry,
                         client_id=client_id,
                     )
@@ -260,6 +396,7 @@ async def handle_client(
                         mac_key=DUMMY_MAC_KEY,
                     )
                     outbound_seq += 1
+                    session_mac_key = _derive_mac_key(session_token, nonce_c)
                     state = "ESTABLISHED"
                     LOGGER.info(
                         "Client %s:%d authenticated as '%s'",
@@ -270,11 +407,156 @@ async def handle_client(
                     continue
 
                 if state == "ESTABLISHED":
-                    LOGGER.info(
-                        "Received %s in ESTABLISHED (not implemented yet); closing",
-                        frame.msg_type.name,
+                    if authenticated_user_id is None:
+                        raise SVPFormatError("missing authenticated user in ESTABLISHED state")
+
+                    if fragmented_put_buffer is not None and frame.msg_type != MsgType.VAULT_PUT:
+                        raise SVPFormatError(
+                            "fragmented VAULT_PUT interrupted by another message type"
+                        )
+
+                    if frame.msg_type == MsgType.PING:
+                        await _send_frame(
+                            writer=writer,
+                            msg_type=MsgType.PONG,
+                            payload=frame.payload,
+                            seq_id=outbound_seq,
+                            mac_key=active_mac_key,
+                        )
+                        outbound_seq += 1
+                        continue
+
+                    if frame.msg_type == MsgType.VAULT_GET:
+                        vault_id, _known_version = _parse_vault_get_payload(frame.payload)
+                        vault_row = await db.get_vault(vault_id)
+                        if vault_row is None:
+                            await _send_frame(
+                                writer=writer,
+                                msg_type=MsgType.ERROR,
+                                payload=_build_error_payload(ERR_NOT_FOUND),
+                                seq_id=outbound_seq,
+                                mac_key=active_mac_key,
+                            )
+                            outbound_seq += 1
+                            continue
+
+                        row_user_id = vault_row.get("user_id")
+                        if row_user_id is not None and int(row_user_id) != authenticated_user_id:
+                            await _send_frame(
+                                writer=writer,
+                                msg_type=MsgType.ERROR,
+                                payload=_build_error_payload(ERR_NOT_FOUND),
+                                seq_id=outbound_seq,
+                                mac_key=active_mac_key,
+                            )
+                            outbound_seq += 1
+                            continue
+
+                        version: int = int(vault_row.get("version") or 0)
+                        blob_value = vault_row.get("blob")
+                        blob: bytes = bytes(blob_value) if blob_value is not None else b""
+                        vault_payload: bytes = _build_vault_data_payload(vault_id, version, blob)
+
+                        outbound_seq = await _send_fragmented_payload(
+                            writer=writer,
+                            msg_type=MsgType.VAULT_DATA,
+                            payload=vault_payload,
+                            seq_id=outbound_seq,
+                            mac_key=active_mac_key,
+                        )
+                        continue
+
+                    if frame.msg_type == MsgType.VAULT_PUT:
+                        is_fragmented: bool = bool(frame.flags & SVPFlags.FRAGMENTED)
+                        is_last_fragment: bool = bool(frame.flags & SVPFlags.LAST_FRAG)
+                        if is_last_fragment and not is_fragmented:
+                            raise SVPFormatError("LAST_FRAG set without FRAGMENTED")
+
+                        payload_to_process: bytes | None = None
+                        if is_fragmented:
+                            if fragmented_put_buffer is None:
+                                fragmented_put_buffer = bytearray()
+                                fragment_started_at = time.monotonic()
+
+                            fragmented_put_buffer.extend(frame.payload)
+                            if len(fragmented_put_buffer) > MAX_FRAGMENTED_VAULT_PUT_BYTES:
+                                fragmented_put_buffer = None
+                                fragment_started_at = None
+                                raise SVPFormatError(
+                                    "fragmented VAULT_PUT exceeds maximum allowed size"
+                                )
+
+                            if not is_last_fragment:
+                                continue
+
+                            payload_to_process = bytes(fragmented_put_buffer)
+                            fragmented_put_buffer = None
+                            fragment_started_at = None
+                        else:
+                            payload_to_process = frame.payload
+
+                        vault_id, base_version, blob = _parse_vault_put_payload(payload_to_process)
+
+                        current_vault = await db.get_vault(vault_id)
+                        current_version: int = 0
+                        if current_vault is not None:
+                            row_user_id = current_vault.get("user_id")
+                            if row_user_id is not None and int(row_user_id) != authenticated_user_id:
+                                await _send_frame(
+                                    writer=writer,
+                                    msg_type=MsgType.ERROR,
+                                    payload=_build_error_payload(ERR_NOT_FOUND),
+                                    seq_id=outbound_seq,
+                                    mac_key=active_mac_key,
+                                )
+                                outbound_seq += 1
+                                continue
+                            current_version = int(current_vault.get("version") or 0)
+
+                        if base_version != current_version:
+                            await _send_frame(
+                                writer=writer,
+                                msg_type=MsgType.ERROR,
+                                payload=_build_error_payload(ERR_CONFLICT),
+                                seq_id=outbound_seq,
+                                mac_key=active_mac_key,
+                            )
+                            outbound_seq += 1
+                            continue
+
+                        new_version: int = current_version + 1
+                        updated: bool = await db.update_vault(
+                            vault_id=vault_id,
+                            user_id=authenticated_user_id,
+                            version=new_version,
+                            blob=blob,
+                            ts=_now_ms(),
+                        )
+                        if not updated:
+                            await _send_frame(
+                                writer=writer,
+                                msg_type=MsgType.ERROR,
+                                payload=_build_error_payload(ERR_CONFLICT),
+                                seq_id=outbound_seq,
+                                mac_key=active_mac_key,
+                            )
+                            outbound_seq += 1
+                            continue
+
+                        ack_payload: bytes = _build_vault_ack_payload(vault_id, new_version)
+                        await _send_frame(
+                            writer=writer,
+                            msg_type=MsgType.VAULT_ACK,
+                            payload=ack_payload,
+                            seq_id=outbound_seq,
+                            mac_key=active_mac_key,
+                        )
+                        outbound_seq += 1
+                        continue
+
+                    raise SVPFormatError(
+                        f"unsupported message in ESTABLISHED: {frame.msg_type.name}"
                     )
-                    return
 
                 raise SVPFormatError(f"Unknown server state: {state}")
     except asyncio.IncompleteReadError:
