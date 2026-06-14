@@ -30,6 +30,8 @@ ERR_AUTH_FAILED: int = 0x06
 ERR_NOT_FOUND: int = 0x08
 ERR_CONFLICT: int = 0x0A
 FRAGMENT_TIMEOUT_SECONDS: float = 30.0
+IDLE_TIMEOUT_SECONDS: float = 90.0
+BYE_REASON_NORMAL: int = 0x00
 
 HELLO_STRUCT: struct.Struct = struct.Struct("<32s16sQ")
 VAULT_GET_STRUCT: struct.Struct = struct.Struct("<16sQ")
@@ -173,7 +175,7 @@ def _parse_hello_payload(payload: bytes) -> tuple[bytes, bytes, int]:
     return nonce_c, client_id, int(timestamp_ms)
 
 
-def _parse_auth_payload(payload: bytes) -> tuple[str, bytes]:
+def _parse_auth_payload(payload: bytes) -> tuple[str, bytes, int, bytes | None]:
     if len(payload) < 1 + 32:
         raise SVPFormatError("AUTH payload is too short")
 
@@ -185,7 +187,7 @@ def _parse_auth_payload(payload: bytes) -> tuple[str, bytes]:
     if username_len == 0 or username_len > 64:
         raise SVPFormatError("AUTH username length is invalid")
 
-    if len(payload) != hmac_end:
+    if len(payload) < hmac_end:
         raise SVPFormatError("AUTH payload has invalid length")
 
     username_bytes: bytes = payload[username_start:username_end]
@@ -195,7 +197,22 @@ def _parse_auth_payload(payload: bytes) -> tuple[str, bytes]:
     except UnicodeDecodeError as exc:
         raise SVPFormatError("AUTH username is not valid UTF-8") from exc
 
-    return username, hmac_resp
+    if len(payload) == hmac_end:
+        return username, hmac_resp, 0, None
+
+    token_refresh: int = payload[hmac_end]
+    remaining: bytes = payload[hmac_end + 1:]
+    if token_refresh == 0:
+        if remaining:
+            raise SVPFormatError("AUTH payload has trailing bytes for token_refresh=0")
+        return username, hmac_resp, token_refresh, None
+
+    if token_refresh == 1:
+        if not remaining:
+            raise SVPFormatError("AUTH token refresh requires a session token")
+        return username, hmac_resp, token_refresh, remaining
+
+    raise SVPFormatError("AUTH token_refresh must be 0x00 or 0x01")
 
 
 def _build_auth_ok_payload(session_token: bytes, expiry_ms: int, vault_version: int) -> bytes:
@@ -287,15 +304,36 @@ async def handle_client(
                     if session_mac_key is None:
                         raise SVPFormatError("missing session MAC key in ESTABLISHED state")
                     active_mac_key = session_mac_key
-
+                read_timeout: float = IDLE_TIMEOUT_SECONDS
                 if state == "ESTABLISHED" and fragmented_put_buffer is not None:
                     if fragment_started_at is None:
                         fragmented_put_buffer = None
+                        fragment_started_at = None
                     else:
-                        remaining: float = FRAGMENT_TIMEOUT_SECONDS - (
+                        remaining_fragment_timeout: float = FRAGMENT_TIMEOUT_SECONDS - (
                             time.monotonic() - fragment_started_at
                         )
-                        if remaining <= 0:
+                        if remaining_fragment_timeout <= 0:
+                            LOGGER.warning(
+                                "Dropping incomplete fragmented VAULT_PUT from %s:%d (timeout)",
+                                client_ip,
+                                client_port,
+                            )
+                            fragmented_put_buffer = None
+                            fragment_started_at = None
+                            continue
+                        read_timeout = min(read_timeout, remaining_fragment_timeout)
+
+                try:
+                    frame = await asyncio.wait_for(
+                        _read_frame(reader, active_mac_key),
+                        timeout=read_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    if state == "ESTABLISHED" and fragmented_put_buffer is not None:
+                        if fragment_started_at is not None and (
+                            time.monotonic() - fragment_started_at
+                        ) >= FRAGMENT_TIMEOUT_SECONDS:
                             LOGGER.warning(
                                 "Dropping incomplete fragmented VAULT_PUT from %s:%d (timeout)",
                                 client_ip,
@@ -305,22 +343,13 @@ async def handle_client(
                             fragment_started_at = None
                             continue
 
-                        try:
-                            frame = await asyncio.wait_for(
-                                _read_frame(reader, active_mac_key),
-                                timeout=remaining,
-                            )
-                        except asyncio.TimeoutError:
-                            LOGGER.warning(
-                                "Dropping incomplete fragmented VAULT_PUT from %s:%d (timeout)",
-                                client_ip,
-                                client_port,
-                            )
-                            fragmented_put_buffer = None
-                            fragment_started_at = None
-                            continue
-                else:
-                    frame = await _read_frame(reader, active_mac_key)
+                    LOGGER.info(
+                        "Session timed out after %.0f seconds for %s:%d",
+                        IDLE_TIMEOUT_SECONDS,
+                        client_ip,
+                        client_port,
+                    )
+                    break
 
                 if state == "GREETING":
                     if frame.msg_type != MsgType.HELLO:
@@ -348,20 +377,45 @@ async def handle_client(
                     if nonce_c is None or nonce_s is None or client_id is None:
                         raise SVPFormatError("Authentication state is incomplete")
 
-                    username, hmac_resp = _parse_auth_payload(frame.payload)
+                    username, hmac_resp, token_refresh, refresh_token = _parse_auth_payload(
+                        frame.payload
+                    )
                     user = await db.get_user_by_username(username)
 
                     auth_valid: bool = False
-                    if user is not None and user.get("k_auth") is not None:
-                        k_auth: bytes = bytes(user["k_auth"])
-                        expected_hmac: bytes = hmac.new(
-                            k_auth,
-                            nonce_c + nonce_s + username.encode("utf-8"),
-                            hashlib.sha256,
-                        ).digest()
-                        auth_valid = hmac.compare_digest(hmac_resp, expected_hmac)
+                    auth_user_id: int | None = None
+                    if token_refresh == 1:
+                        if user is not None and refresh_token is not None:
+                            session_row = await db.get_session(refresh_token)
+                            if session_row is not None:
+                                session_expiry: int = int(session_row.get("expiry") or 0)
+                                session_user_id: int = int(session_row.get("user_id") or 0)
+                                session_client_id_value = session_row.get("client_id")
+                                session_client_id: bytes = (
+                                    bytes(session_client_id_value)
+                                    if session_client_id_value is not None
+                                    else b""
+                                )
+                                if (
+                                    session_expiry > _now_ms()
+                                    and session_user_id == int(user["id"])
+                                    and session_client_id == client_id
+                                ):
+                                    auth_valid = True
+                                    auth_user_id = session_user_id
+                    else:
+                        if user is not None and user.get("k_auth") is not None:
+                            k_auth: bytes = bytes(user["k_auth"])
+                            expected_hmac: bytes = hmac.new(
+                                k_auth,
+                                nonce_c + nonce_s + username.encode("utf-8"),
+                                hashlib.sha256,
+                            ).digest()
+                            auth_valid = hmac.compare_digest(hmac_resp, expected_hmac)
+                            if auth_valid:
+                                auth_user_id = int(user["id"])
 
-                    if not auth_valid:
+                    if not auth_valid or auth_user_id is None:
                         await _send_frame(
                             writer=writer,
                             msg_type=MsgType.AUTH_FAIL,
@@ -375,7 +429,7 @@ async def handle_client(
 
                     session_token: bytes = os.urandom(32)
                     expiry: int = _now_ms() + SESSION_TTL_MS
-                    authenticated_user_id = int(user["id"])
+                    authenticated_user_id = auth_user_id
                     await db.create_session(
                         token=session_token,
                         user_id=authenticated_user_id,
@@ -416,15 +470,32 @@ async def handle_client(
                         )
 
                     if frame.msg_type == MsgType.PING:
+                        if len(frame.payload) != 8:
+                            raise SVPFormatError("PING payload must be exactly 8 bytes")
+                        ping_timestamp: int = struct.unpack("<q", frame.payload)[0]
                         await _send_frame(
                             writer=writer,
                             msg_type=MsgType.PONG,
-                            payload=frame.payload,
+                            payload=struct.pack("<q", ping_timestamp),
                             seq_id=outbound_seq,
                             mac_key=active_mac_key,
                         )
                         outbound_seq += 1
                         continue
+
+                    if frame.msg_type == MsgType.BYE:
+                        if len(frame.payload) != 1:
+                            raise SVPFormatError("BYE payload must be exactly 1 byte")
+                        _reason_code: int = frame.payload[0]
+                        await _send_frame(
+                            writer=writer,
+                            msg_type=MsgType.BYE,
+                            payload=bytes([BYE_REASON_NORMAL]),
+                            seq_id=outbound_seq,
+                            mac_key=active_mac_key,
+                        )
+                        outbound_seq += 1
+                        break
 
                     if frame.msg_type == MsgType.VAULT_GET:
                         vault_id, _known_version = _parse_vault_get_payload(frame.payload)
