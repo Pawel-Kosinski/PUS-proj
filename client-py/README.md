@@ -1,17 +1,16 @@
-# SecVault — klient (Python)
+# SecVault - klient (Python)
 
-Port klienta CLI z C++ na Pythona. Mówi tym samym protokołem **SVP v1.0** (TCP + TLS 1.3)
-i jest **zgodny na poziomie bajtów** z wersją C++ oraz [../client/PROTOCOL.md](../client/PROTOCOL.md)
-— sejf zaszyfrowany jednym klientem odszyfruje drugi (zweryfikowane w obie strony).
+Klient CLI dla projektu SecVault (PUS), interoperacyjny z serwerem Python z katalogu [../server-py](../server-py).
+Komunikacja odbywa sie przez SVP v1.0 (binarne ramki) po TCP z obowiazkowym TLS 1.3.
 
-Cała kryptografia działa po stronie klienta (zero-knowledge): serwer nie poznaje hasła
-głównego ani odszyfrowanej zawartości sejfu.
+Kryptografia danych sejfu jest wykonywana po stronie klienta (model zero-knowledge):
+serwer przechowuje zaszyfrowane bloby i metadane wersjonowania.
 
-## Zależności
+## Zaleznosci
 
-- Python 3.8+
-- pakiet [`cryptography`](https://pypi.org/project/cryptography/) (AES-256-GCM, HKDF)
-- moduły standardowe: `socket`, `ssl`, `hashlib`, `hmac`, `secrets`, `struct`, `getpass`
+- Python 3.13+ (zalecane: wspolne `.venv` w katalogu glownym projektu)
+- `cryptography` (AES-256-GCM, HKDF)
+- modul standardowy: `socket`, `ssl`, `hashlib`, `hmac`, `secrets`, `struct`, `getpass`
 
 ```bash
 pip install -r requirements.txt
@@ -20,60 +19,92 @@ pip install -r requirements.txt
 ## Uruchomienie
 
 ```bash
-python3 secvault.py --host 127.0.0.1 --port 7443 [--ca ca-cert.pem] [--insecure] \
-                    [--cache .svp_cache] [--offline] [--debug]
+python secvault.py --host 127.0.0.1 --port 7443 [--ca ca-cert.pem] [--insecure] \
+                   [--cache .svp_cache] [--offline] [--debug]
 
-python3 secvault.py --selftest      # self-test kryptografii (KAT + roundtrip, bez serwera)
+python secvault.py --selftest
 ```
 
-- `--insecure` — wyłącza weryfikację certyfikatu (cert self-signed / laboratorium).
-- `--ca plik.pem` — CA do weryfikacji certyfikatu serwera.
-- `--offline` — praca na lokalnej, zaszyfrowanej kopii sejfu (tylko odczyt).
-- `--debug` — metadane ramek SVP (tx/rx) na stderr.
+- `--insecure` - wylacza weryfikacje certyfikatu (lokalne testy z cert self-signed).
+- `--ca plik.pem` - weryfikacja certyfikatu serwera przez wskazane CA.
+- `--offline` - praca na lokalnej zaszyfrowanej kopii (`.svp_cache`).
+- `--debug` - metadane ramek SVP na stderr.
 
-Po starcie: nazwa użytkownika + hasło główne (bez echa), następnie REPL:
+Po starcie klient uruchamia REPL:
 
-```
+```text
 ls · get <serwis|id> · add · edit <serwis|id> · rm <serwis|id>
 sync · pull · ping · help · quit
 ```
 
-## Mapowanie modułów (C++ → Python)
+## Architektura klienta
 
-| C++ (`client/src/`) | Python (`client-py/`) | Zawartość |
-|---|---|---|
-| `protocol.h` | `protocol.py` | stałe SVP: typy, flagi, kody błędów, parametry krypto |
-| `crypto.*` | `svpcrypto.py` | PBKDF2/HMAC/SHA256 (stdlib) + AES-256-GCM/HKDF (`cryptography`) |
-| `bytes.h` + `frame.*` | `framing.py` | `ByteWriter`/`ByteReader`, `Frame`, serializacja + trailer HMAC |
-| `tls.*` | `transport.py` | gniazdo TCP + TLS 1.3 (`socket` + `ssl`), całe ramki SVP |
-| `vault.*` | `vault.py` | sejf w RAM: CRUD, szyfrowanie, scalanie konfliktów |
-| `client.*` | `svpclient.py` | maszyna stanów: login/register/get/put/refresh |
-| `main.cpp` | `secvault.py` | CLI / REPL, getpass, lokalny cache, self-test |
+| Modul | Rola |
+|---|---|
+| `protocol.py` | stale SVP (typy wiadomosci, flagi, limity, kody bledow) |
+| `framing.py` | `ByteWriter`/`ByteReader`, serializacja i parse ramek 11B + HMAC |
+| `transport.py` | TCP + TLS 1.3 (`ssl.create_default_context`, `wrap_socket`) |
+| `svpcrypto.py` | PBKDF2/HMAC/SHA256 + AES-256-GCM + HKDF |
+| `svpclient.py` | maszyna stanow klienta (HELLO/AUTH, refresh, VAULT_GET/PUT, PING/BYE) |
+| `vault.py` | model sejfu w RAM, CRUD, (de)szyfrowanie, merge konfliktow |
+| `secvault.py` | CLI/REPL i orchestration flow |
 
-Styl gniazd i TLS wzorowany na przykładach referencyjnych (moduł `socket` + `ssl`,
-`create_default_context`, `wrap_socket`).
+## Obslugiwane scenariusze
 
-## Realizowane przypadki użycia
+- Logowanie challenge-response (z opcjonalnym TOTP).
+- Wznowienie sesji tokenem (refresh AUTH).
+- Pobieranie i zapis sejfu z optimistic locking (CAS).
+- Obsluga konfliktu wersji (merge po stronie klienta).
+- Keep-alive PING/PONG i zamkniecie BYE.
 
-| UC | Opis | Gdzie |
-|----|------|-------|
-| UC-01 | Logowanie challenge-response (PBKDF2 + HMAC) | `Client.login` |
-| UC-02 | Pobranie i deszyfracja sejfu | `Client.fetch_vault`, `Vault.decrypt` |
-| UC-03 | Zapis sejfu (optimistic locking, `base_version`) | `Client.put_vault`, `do_sync` |
-| UC-04 | Konflikt wersji → scalanie → ponowny PUT | `Vault.merge_from`, `do_sync` |
-| UC-05 | Wznowienie sesji tokenem po zerwaniu | `Client.ensure_session` / `refresh_session` |
-| UC-06 | TOTP (pole w AUTH) | flaga `FLAG_TOTP_PRESENT` w `Client.login` |
-| REGISTER | Rejestracja konta z CLI (rozszerzenie) | `Client.register_account` |
+## Manual E2E Tutorial (2 terminale)
 
-## Test end-to-end (z zaślepką serwera)
+### 1. Uruchom serwer (Terminal 1)
 
-Reużywamy stuba z wersji C++ ([../client/test/stub_server.py](../client/test/stub_server.py)) —
-działa na poziomie protokołu, więc obsługuje obu klientów.
-
-```bash
-# terminal 1 — serwer-zaślepka (TLS 1.3, ten sam protokół):
-cd ../client/test && python3 stub_server.py 7443
-
-# terminal 2 — klient Python:
-cd client-py && python3 secvault.py --host 127.0.0.1 --port 7443 --insecure
+```powershell
+cd C:\Users\05lan\Desktop\PUS-proj\server-py
+& "C:\Users\05lan\Desktop\PUS-proj\.venv\Scripts\python.exe" server.py
 ```
+
+### 2. Uruchom klienta CLI (Terminal 2)
+
+```powershell
+cd C:\Users\05lan\Desktop\PUS-proj\client-py
+& "C:\Users\05lan\Desktop\PUS-proj\.venv\Scripts\python.exe" secvault.py --host 127.0.0.1 --port 7443 --insecure
+```
+
+### 3. Wykonaj pelna sesje uzytkownika
+
+W promptach logowania wpisz:
+
+```text
+Uzytkownik: alice
+Haslo glowne: alicepass
+Zaloguj (l) czy zarejestruj nowe konto (r)? [l]
+l
+```
+
+Nastepnie w REPL wykonaj:
+
+```text
+add
+github.com
+alice
+pass123
+manual-e2e
+
+sync
+pull
+ping
+ls
+quit
+```
+
+### 4. Zatrzymaj serwer
+
+W Terminalu 1 nacisnij `Ctrl+C`.
+
+## Uwagi
+
+- Jesli logowanie `alice` nie przechodzi, zseeduj uzytkownika zgodnie z instrukcja w [../server-py/README.md](../server-py/README.md).
+- `--insecure` sluzy tylko do lokalnych testow developerskich.

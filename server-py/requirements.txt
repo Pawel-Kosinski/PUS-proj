@@ -1,0 +1,5 @@
+aiosqlite
+cryptography
+pyotp
+pytest
+pytest-asyncio

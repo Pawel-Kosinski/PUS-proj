@@ -6,7 +6,7 @@
 !/server-py/
 !SecVault_etap1.md
 !SecVault_etap2.md
-
+!README.md
 server-py\__pycache__
 **/.pytest_cache
 # Artefakty kompilacji
