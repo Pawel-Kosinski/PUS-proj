@@ -31,25 +31,25 @@ TEST_K_AUTH: bytes = b"test_k_auth_32_bytes_long_string!"
 
 
 @dataclass(frozen=True)
-class TestDbInfo:
+class MockDbInfo:
     path: Path
     user_id: int
 
 
 @pytest_asyncio.fixture
-async def test_db_info(tmp_path: Path) -> AsyncIterator[TestDbInfo]:
+async def test_db_info(tmp_path: Path) -> AsyncIterator[MockDbInfo]:
     db_path: Path = tmp_path / "secvault_test.db"
     await init_db(str(db_path))
 
     async with DatabaseManager(str(db_path)) as db:
         user_id: int = await db.create_user(TEST_USERNAME, TEST_K_AUTH)
 
-    yield TestDbInfo(path=db_path, user_id=user_id)
+    yield MockDbInfo(path=db_path, user_id=user_id)
 
 
 @pytest_asyncio.fixture
 async def running_server(
-    test_db_info: TestDbInfo,
+    test_db_info: MockDbInfo,
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[tuple[str, int]]:
     monkeypatch.setattr(svp_server, "DB_PATH", str(test_db_info.path))
@@ -119,7 +119,7 @@ async def _send_frame(
 @pytest.mark.asyncio
 async def test_successful_handshake(
     running_server: tuple[str, int],
-    test_db_info: TestDbInfo,
+    test_db_info: MockDbInfo,
 ) -> None:
     host, port = running_server
     reader, writer = await asyncio.open_connection(
