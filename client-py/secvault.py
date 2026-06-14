@@ -40,7 +40,7 @@ def save_cache(path, login, vault_id, version, blob):
     w.raw(_CACHE_MAGIC)
     w.lpstr(login)
     w.raw(vault_id)
-    w.u32(version)
+    w.u64(version)
     w.lpblob(blob)
     with open(path, "wb") as f:
         f.write(w.take())
@@ -59,7 +59,7 @@ def load_cache(path):
             return None
         login = r.lpstr()
         vault_id = r.raw(protocol.VAULT_ID_LEN)
-        version = r.u32()
+        version = r.u64()
         blob = r.lpblob()
         return login, vault_id, version, blob
     except (FrameError, ValueError):
