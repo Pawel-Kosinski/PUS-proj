@@ -12,6 +12,7 @@ import time
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+import pyotp
 
 from database import DatabaseManager, init_db
 from protocol import MsgType, SVPCodec, SVPFlags, SVPFormatError, SVPFrame, SVPHmacError
@@ -40,6 +41,7 @@ AUTH_OK_TRAILER_STRUCT: struct.Struct = struct.Struct("<QQ")
 AUTH_FAIL_STRUCT: struct.Struct = struct.Struct("<BI")
 MAX_VAULT_BLOB_BYTES: int = 50 * 1024 * 1024
 MAX_FRAGMENTED_VAULT_PUT_BYTES: int = MAX_VAULT_BLOB_BYTES + VAULT_PUT_HEADER_STRUCT.size
+SESSION_TOKEN_LEN: int = 32
 
 LOGGER: logging.Logger = logging.getLogger("secvault.server")
 
@@ -175,7 +177,9 @@ def _parse_hello_payload(payload: bytes) -> tuple[bytes, bytes, int]:
     return nonce_c, client_id, int(timestamp_ms)
 
 
-def _parse_auth_payload(payload: bytes) -> tuple[str, bytes, int, bytes | None]:
+def _parse_auth_payload(
+    payload: bytes,
+) -> tuple[str, bytes, int, bytes | None, int, int | None]:
     if len(payload) < 1 + 32:
         raise SVPFormatError("AUTH payload is too short")
 
@@ -198,21 +202,39 @@ def _parse_auth_payload(payload: bytes) -> tuple[str, bytes, int, bytes | None]:
         raise SVPFormatError("AUTH username is not valid UTF-8") from exc
 
     if len(payload) == hmac_end:
-        return username, hmac_resp, 0, None
+        return username, hmac_resp, 0, None, 0, None
 
     token_refresh: int = payload[hmac_end]
-    remaining: bytes = payload[hmac_end + 1:]
+    idx: int = hmac_end + 1
+    refresh_token: bytes | None = None
     if token_refresh == 0:
-        if remaining:
-            raise SVPFormatError("AUTH payload has trailing bytes for token_refresh=0")
-        return username, hmac_resp, token_refresh, None
+        pass
+    elif token_refresh == 1:
+        remaining_len: int = len(payload) - idx
+        if remaining_len < SESSION_TOKEN_LEN:
+            raise SVPFormatError("AUTH token refresh requires a full session token")
+        refresh_token = payload[idx:idx + SESSION_TOKEN_LEN]
+        idx += SESSION_TOKEN_LEN
+    else:
+        raise SVPFormatError("AUTH token_refresh must be 0x00 or 0x01")
 
-    if token_refresh == 1:
-        if not remaining:
-            raise SVPFormatError("AUTH token refresh requires a session token")
-        return username, hmac_resp, token_refresh, remaining
+    if idx == len(payload):
+        return username, hmac_resp, token_refresh, refresh_token, 0, None
 
-    raise SVPFormatError("AUTH token_refresh must be 0x00 or 0x01")
+    totp_present: int = payload[idx]
+    idx += 1
+    if totp_present == 0:
+        if idx != len(payload):
+            raise SVPFormatError("AUTH payload has trailing bytes after totp_present=0x00")
+        return username, hmac_resp, token_refresh, refresh_token, totp_present, None
+
+    if totp_present == 1:
+        if len(payload) - idx != 4:
+            raise SVPFormatError("AUTH payload must include 4-byte TOTP code")
+        totp_code: int = struct.unpack_from("<I", payload, idx)[0]
+        return username, hmac_resp, token_refresh, refresh_token, totp_present, totp_code
+
+    raise SVPFormatError("AUTH totp_present must be 0x00 or 0x01")
 
 
 def _build_auth_ok_payload(session_token: bytes, expiry_ms: int, vault_version: int) -> bytes:
@@ -377,9 +399,14 @@ async def handle_client(
                     if nonce_c is None or nonce_s is None or client_id is None:
                         raise SVPFormatError("Authentication state is incomplete")
 
-                    username, hmac_resp, token_refresh, refresh_token = _parse_auth_payload(
-                        frame.payload
-                    )
+                    (
+                        username,
+                        hmac_resp,
+                        token_refresh,
+                        refresh_token,
+                        totp_present,
+                        totp_code,
+                    ) = _parse_auth_payload(frame.payload)
                     user = await db.get_user_by_username(username)
 
                     auth_valid: bool = False
@@ -414,6 +441,19 @@ async def handle_client(
                             auth_valid = hmac.compare_digest(hmac_resp, expected_hmac)
                             if auth_valid:
                                 auth_user_id = int(user["id"])
+
+                                totp_secret_value = user.get("totp_secret")
+                                if totp_secret_value is not None:
+                                    if totp_present != 1 or totp_code is None:
+                                        auth_valid = False
+                                    else:
+                                        totp_secret: str = str(totp_secret_value)
+                                        totp = pyotp.TOTP(totp_secret)
+                                        is_totp_valid: bool = totp.verify(
+                                            str(totp_code).zfill(6)
+                                        )
+                                        if not is_totp_valid:
+                                            auth_valid = False
 
                     if not auth_valid or auth_user_id is None:
                         await _send_frame(
